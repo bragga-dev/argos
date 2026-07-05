@@ -1,0 +1,31 @@
+# Ambiente virtual
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Arquivos Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Arquivos de desenvolvimento
+*.log
+*.pid
+*.seed
+*.pid.lock
+
+# Arquivos de IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Arquivos do sistema
+.DS_Store
+Thumbs.db
