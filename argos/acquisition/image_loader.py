@@ -15,16 +15,12 @@ Regras desta camada:
 import os
 from pathlib import Path
 from typing import Optional, Tuple
+from validators.validate_image_file import validate_image_file, ImageValidationError
 
 import cv2
 import numpy as np
 
 from acquisition.metadata import ImageMetadata
-
-
-# Formatos suportados pelo ARGOS
-SUPPORTED_EXTENSIONS = {".tiff", ".tif", ".png", ".jpg", ".jpeg"}
-
 
 class ImageLoadError(Exception):
     """Erro lançado quando a imagem não pode ser carregada."""
@@ -44,6 +40,11 @@ class ImageLoader:
         """
         Carrega uma imagem e retorna o array NumPy + metadados básicos.
 
+        A validação é feita ANTES do carregamento para garantir que:
+            - O arquivo não está corrompido
+            - O formato é suportado
+            - A imagem não excede limites de tamanho e dimensões
+
         Args:
             file_path: Caminho completo para o arquivo de imagem.
 
@@ -51,40 +52,37 @@ class ImageLoader:
             Tupla (imagem_numpy, metadados).
 
         Raises:
-            ImageLoadError: Se o arquivo não existir, formato inválido, ou
-                            imagem corrompida.
-
-        O que é np.ndarray?
-            É a estrutura de dados principal do NumPy.
-            Uma imagem colorida é representada como um array 3D:
-            (altura, largura, canais) → ex: (1024, 1024, 3) para BGR.
+            ImageLoadError: Se o arquivo não existir, formato inválido, imagem corrompida
+            ImageValidationError: Se a imagem não passar nos critérios de validação
         """
+        
         path = Path(file_path)
 
         # 1. Verifica se o arquivo existe
         if not path.exists():
             raise ImageLoadError(f"Arquivo não encontrado: {file_path}")
 
-        # 2. Verifica se a extensão é suportada
-        ext = path.suffix.lower()
-        if ext not in SUPPORTED_EXTENSIONS:
-            raise ImageLoadError(
-                f"Formato '{ext}' não suportado. "
-                f"Use: {', '.join(SUPPORTED_EXTENSIONS)}"
-            )
+        # 2. VALIDAÇÃO - Usa a função existente
+        #    A função já verifica: extensão, tamanho, integridade, formato e dimensões
+        try:
+            is_valid = validate_image_file(file_path)
+            if not is_valid:
+                # Teoricamente não chega aqui, pois a função levanta exceção
+                raise ImageValidationError("Validação falhou por motivo desconhecido.")
+        except ImageValidationError as e:
+            # Relança com contexto mais claro
+            raise ImageLoadError(f"Falha na validação da imagem: {e}")
+        except FileNotFoundError as e:
+            # Já foi verificado, mas pode ocorrer em race condition
+            raise ImageLoadError(f"Arquivo não encontrado: {e}")
+        except Exception as e:
+            # Captura qualquer outro erro inesperado da validação
+            raise ImageLoadError(f"Erro inesperado na validação: {e}")
 
-        # 3. Carrega a imagem com OpenCV
-        # cv2.IMREAD_UNCHANGED preserva: escala de cinza, 16-bit, alpha channel
-        # Isso é importante para TIFF metalográficos de alta profundidade
+        # 3. Carrega a imagem com OpenCV (já sabemos que é válida)
         image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
 
-        if image is None:
-            raise ImageLoadError(
-                f"Não foi possível ler o arquivo: {file_path}\n"
-                f"O arquivo pode estar corrompido ou em formato não suportado."
-            )
-
-        # 4. Normaliza para 8-bit se necessário (TIFF pode ser 16-bit)
+        # 4. Normaliza para 8-bit se necessário
         image = self._normalize_to_8bit(image)
 
         # 5. Monta os metadados básicos
