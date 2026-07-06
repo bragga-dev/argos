@@ -4,26 +4,40 @@ app/main_window.py
 Janela principal do ARGOS.
 Conecta todos os módulos: aquisição → pré-processamento → visualização.
 
+MUDANÇA DE UI (v2):
+    Cada filtro agora é um par CHECKBOX + SLIDER, em vez de botão "Aplicar":
+        • Checkbox desmarcado → filtro desligado, slider desabilitado
+        • Checkbox marcado → filtro ligado, valor do slider é aplicado
+        • Mover o slider (com checkbox marcado) atualiza o resultado
+          em tempo real
+
+    Toda mudança (toggle ou slider) chama self._on_state_changed(), que:
+        1. Atualiza o estado correspondente no ImageProcessor
+        2. Chama processor.rebuild() — recalcula do zero a partir do original
+        3. Atualiza o viewer com o novo resultado
+
 Layout:
     ┌─────────────────────────────────────────────┐
     │  Toolbar (Abrir, Escala, Metadados)          │
     ├──────────────────────┬──────────────────────┤
     │   Painel Esquerdo    │   Painel Direito      │
-    │   (Controles de      │   (Original | Atual)  │
-    │    filtros)          │                       │
+    │   (checkbox+slider   │   (Original | Atual)  │
+    │    por filtro)       │                       │
     ├──────────────────────┴──────────────────────┤
     │  Status Bar (escala, dimensões, operações)   │
     └─────────────────────────────────────────────┘
 """
 
+from typing import Callable, Optional
+
 import numpy as np
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QSplitter, QToolBar, QStatusBar, QLabel, QSlider,
-    QPushButton, QGroupBox, QScrollArea, QSizePolicy,
+    QGroupBox, QScrollArea, QSizePolicy,
     QFileDialog, QMessageBox, QFrame, QCheckBox
 )
-from PyQt6.QtGui import QAction, QIcon, QFont
+from PyQt6.QtGui import QAction
 from PyQt6.QtCore import Qt
 
 from acquisition.image_loader import ImageLoader, ImageLoadError
@@ -42,10 +56,10 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         # Estado da aplicação
-        self._original_image: np.ndarray | None = None
-        self._metadata: ImageMetadata | None = None
+        self._original_image: Optional[np.ndarray] = None
+        self._metadata: Optional[ImageMetadata] = None
         self._scale_manager = ScaleManager()
-        self._processor: ImageProcessor | None = None
+        self._processor: Optional[ImageProcessor] = None
 
         self.setWindowTitle("ARGOS — Análise Metalográfica")
         self.setMinimumSize(1100, 700)
@@ -71,7 +85,6 @@ class MainWindow(QMainWindow):
         toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.addToolBar(toolbar)
 
-        # Ação: Abrir imagem
         self.act_open = QAction("📂  Abrir Imagem", self)
         self.act_open.setShortcut("Ctrl+O")
         self.act_open.setToolTip("Abrir imagem metalográfica (Ctrl+O)")
@@ -80,13 +93,11 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        # Ação: Calibrar escala
         self.act_scale = QAction("⚖️  Calibrar Escala", self)
         self.act_scale.setToolTip("Definir escala µm/pixel")
         self.act_scale.triggered.connect(self._on_calibrate_scale)
         toolbar.addAction(self.act_scale)
 
-        # Ação: Metadados
         self.act_metadata = QAction("📋  Metadados", self)
         self.act_metadata.setToolTip("Editar metadados da amostra")
         self.act_metadata.triggered.connect(self._on_edit_metadata)
@@ -94,9 +105,8 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        # Ação: Reset processamento
         self.act_reset = QAction("↺  Resetar Filtros", self)
-        self.act_reset.setToolTip("Desfaz todos os filtros, volta à imagem original")
+        self.act_reset.setToolTip("Desliga todos os filtros, volta à imagem original")
         self.act_reset.triggered.connect(self._on_reset)
         toolbar.addAction(self.act_reset)
 
@@ -108,27 +118,101 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # Splitter divide painel esquerdo (controles) e direito (imagens)
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # Painel esquerdo: controles de filtro
         left_panel = self._build_left_panel()
         splitter.addWidget(left_panel)
 
-        # Painel direito: visualizadores
         right_panel = self._build_right_panel()
         splitter.addWidget(right_panel)
 
-        splitter.setSizes([300, 800])
+        splitter.setSizes([320, 800])
         splitter.setHandleWidth(2)
 
         main_layout.addWidget(splitter)
+
+    # ──────────────────────────────────────────────
+    # Widget reutilizável: Checkbox + Slider
+    # ──────────────────────────────────────────────
+
+    def _build_toggle_slider(
+        self,
+        label_text: str,
+        min_val: int,
+        max_val: int,
+        default_val: int,
+        on_toggled: Callable[[bool], None],
+        on_value_changed: Callable[[int], None],
+        value_formatter: Callable[[int], str] = str,
+    ) -> tuple[QCheckBox, QSlider, QWidget]:
+        """
+        Cria um controle padrão de filtro: checkbox (liga/desliga) +
+        slider (intensidade), com label de valor ao lado do checkbox.
+
+        Comportamento:
+            • Slider começa desabilitado (filtro desligado por padrão)
+            • Marcar o checkbox habilita o slider e dispara on_toggled(True)
+            • Desmarcar desabilita o slider e dispara on_toggled(False)
+            • Mover o slider só dispara on_value_changed() se o
+              checkbox estiver marcado (evita recálculo com filtro inativo)
+
+        Args:
+            label_text: Nome do filtro, exibido no checkbox.
+            min_val, max_val, default_val: Range do slider (inteiros;
+                para valores fracionários, escale no callback, ex: v/100).
+            on_toggled: Chamado com True/False quando o checkbox muda.
+            on_value_changed: Chamado com o valor do slider quando ele
+                muda E o checkbox está marcado.
+            value_formatter: Formata o valor numérico para exibição
+                (ex: lambda v: f"{v/100:.2f}x" para contraste).
+
+        Returns:
+            (checkbox, slider, container_widget) — o container já vem
+            pronto para addWidget() no layout do grupo.
+        """
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 4, 0, 4)
+        layout.setSpacing(4)
+
+        header = QHBoxLayout()
+        checkbox = QCheckBox(label_text)
+        value_label = QLabel(value_formatter(default_val))
+        value_label.setStyleSheet("color: #6c9bcf; font-size: 11px;")
+        header.addWidget(checkbox)
+        header.addStretch()
+        header.addWidget(value_label)
+        layout.addLayout(header)
+
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(min_val, max_val)
+        slider.setValue(default_val)
+        slider.setEnabled(False)
+        layout.addWidget(slider)
+
+        def _handle_toggle(checked: bool):
+            slider.setEnabled(checked)
+            on_toggled(checked)
+
+        def _handle_value(v: int):
+            value_label.setText(value_formatter(v))
+            if checkbox.isChecked():
+                on_value_changed(v)
+
+        checkbox.toggled.connect(_handle_toggle)
+        slider.valueChanged.connect(_handle_value)
+
+        return checkbox, slider, container
+
+    # ──────────────────────────────────────────────
+    # Painel esquerdo — grupos de filtro
+    # ──────────────────────────────────────────────
 
     def _build_left_panel(self) -> QWidget:
         """Painel esquerdo com controles de pré-processamento."""
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(300)
+        scroll.setFixedWidth(320)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         container = QWidget()
@@ -136,7 +220,6 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(12)
 
-        # --- Título ---
         title = QLabel("PRÉ-PROCESSAMENTO")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet(
@@ -145,19 +228,10 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(title)
 
-        # --- Grupo: Conversão ---
         layout.addWidget(self._build_grayscale_group())
-
-        # --- Grupo: Brilho / Contraste ---
-        layout.addWidget(self._build_brightness_group())
-
-        # --- Grupo: Equalização CLAHE ---
+        layout.addWidget(self._build_brightness_contrast_group())
         layout.addWidget(self._build_clahe_group())
-
-        # --- Grupo: Filtros de suavização ---
-        layout.addWidget(self._build_blur_group())
-
-        # --- Grupo: Realce de bordas ---
+        layout.addWidget(self._build_smoothing_group())
         layout.addWidget(self._build_edge_group())
 
         layout.addStretch()
@@ -165,50 +239,34 @@ class MainWindow(QMainWindow):
         return scroll
 
     def _build_grayscale_group(self) -> QGroupBox:
+        """Grayscale não tem parâmetro — só checkbox liga/desliga."""
         group = QGroupBox("Conversão")
         layout = QVBoxLayout(group)
 
-        self.btn_grayscale = QPushButton("Converter para Escala de Cinza")
-        self.btn_grayscale.clicked.connect(self._on_apply_grayscale)
-        layout.addWidget(self.btn_grayscale)
+        self.chk_grayscale = QCheckBox("Escala de Cinza")
+        self.chk_grayscale.toggled.connect(self._on_grayscale_toggled)
+        layout.addWidget(self.chk_grayscale)
 
         return group
 
-    def _build_brightness_group(self) -> QGroupBox:
+    def _build_brightness_contrast_group(self) -> QGroupBox:
         group = QGroupBox("Brilho e Contraste")
         layout = QVBoxLayout(group)
 
-        # Brilho
-        layout.addWidget(QLabel("Brilho:"))
-        self.brightness_slider = QSlider(Qt.Orientation.Horizontal)
-        self.brightness_slider.setRange(-127, 127)
-        self.brightness_slider.setValue(0)
-        self.brightness_label = QLabel("0")
-        self.brightness_slider.valueChanged.connect(
-            lambda v: self.brightness_label.setText(str(v))
+        self.chk_brightness, self.sld_brightness, w1 = self._build_toggle_slider(
+            "Brilho", -127, 127, 0,
+            on_toggled=self._on_brightness_toggled,
+            on_value_changed=self._on_brightness_value,
         )
-        row = QHBoxLayout()
-        row.addWidget(self.brightness_slider)
-        row.addWidget(self.brightness_label)
-        layout.addLayout(row)
+        layout.addWidget(w1)
 
-        # Contraste
-        layout.addWidget(QLabel("Contraste:"))
-        self.contrast_slider = QSlider(Qt.Orientation.Horizontal)
-        self.contrast_slider.setRange(10, 300)  # 0.1x a 3.0x (×0.01)
-        self.contrast_slider.setValue(100)
-        self.contrast_label = QLabel("1.00×")
-        self.contrast_slider.valueChanged.connect(
-            lambda v: self.contrast_label.setText(f"{v/100:.2f}×")
+        self.chk_contrast, self.sld_contrast, w2 = self._build_toggle_slider(
+            "Contraste", 10, 300, 100,
+            on_toggled=self._on_contrast_toggled,
+            on_value_changed=self._on_contrast_value,
+            value_formatter=lambda v: f"{v/100:.2f}×",
         )
-        row2 = QHBoxLayout()
-        row2.addWidget(self.contrast_slider)
-        row2.addWidget(self.contrast_label)
-        layout.addLayout(row2)
-
-        btn = QPushButton("▶  Aplicar")
-        btn.clicked.connect(self._on_apply_brightness_contrast)
-        layout.addWidget(btn)
+        layout.addWidget(w2)
 
         return group
 
@@ -216,56 +274,48 @@ class MainWindow(QMainWindow):
         group = QGroupBox("CLAHE — Contraste Local")
         layout = QVBoxLayout(group)
 
-        layout.addWidget(QLabel("Clip Limit:"))
-        self.clahe_clip_slider = QSlider(Qt.Orientation.Horizontal)
-        self.clahe_clip_slider.setRange(10, 100)  # 1.0 a 10.0 (×0.1)
-        self.clahe_clip_slider.setValue(20)
-        self.clahe_clip_label = QLabel("2.0")
-        self.clahe_clip_slider.valueChanged.connect(
-            lambda v: self.clahe_clip_label.setText(f"{v/10:.1f}")
+        self.chk_clahe, self.sld_clahe, w = self._build_toggle_slider(
+            "CLAHE", 10, 100, 20,
+            on_toggled=self._on_clahe_toggled,
+            on_value_changed=self._on_clahe_value,
+            value_formatter=lambda v: f"clip={v/10:.1f}",
         )
-        row = QHBoxLayout()
-        row.addWidget(self.clahe_clip_slider)
-        row.addWidget(self.clahe_clip_label)
-        layout.addLayout(row)
-
-        btn = QPushButton("▶  Aplicar CLAHE")
-        btn.clicked.connect(self._on_apply_clahe)
-        layout.addWidget(btn)
+        layout.addWidget(w)
 
         return group
 
-    def _build_blur_group(self) -> QGroupBox:
+    def _build_smoothing_group(self) -> QGroupBox:
+        """
+        Os três filtros de suavização são independentes entre si —
+        o usuário pode ligar mais de um ao mesmo tempo (são aplicados
+        em sequência fixa: Gaussiano → Mediana → Bilateral).
+        """
         group = QGroupBox("Filtros de Suavização")
         layout = QVBoxLayout(group)
 
-        layout.addWidget(QLabel("Tamanho do kernel:"))
-        self.blur_kernel_slider = QSlider(Qt.Orientation.Horizontal)
-        self.blur_kernel_slider.setRange(1, 15)
-        self.blur_kernel_slider.setValue(5)
-        self.blur_kernel_label = QLabel("5")
-        self.blur_kernel_slider.valueChanged.connect(
-            lambda v: self.blur_kernel_label.setText(str(v if v % 2 == 1 else v + 1))
+        self.chk_gaussian, self.sld_gaussian, w1 = self._build_toggle_slider(
+            "Gaussiano", 1, 15, 5,
+            on_toggled=self._on_gaussian_toggled,
+            on_value_changed=self._on_gaussian_value,
+            value_formatter=lambda v: f"k={v if v % 2 else v + 1}",
         )
-        row = QHBoxLayout()
-        row.addWidget(self.blur_kernel_slider)
-        row.addWidget(self.blur_kernel_label)
-        layout.addLayout(row)
+        layout.addWidget(w1)
 
-        btn_gauss = QPushButton("▶  Gaussiano")
-        btn_gauss.clicked.connect(self._on_apply_gaussian)
-        btn_gauss.setToolTip("Suavização geral — reduz todo tipo de ruído")
-        layout.addWidget(btn_gauss)
+        self.chk_median, self.sld_median, w2 = self._build_toggle_slider(
+            "Mediana", 1, 15, 5,
+            on_toggled=self._on_median_toggled,
+            on_value_changed=self._on_median_value,
+            value_formatter=lambda v: f"k={v if v % 2 else v + 1}",
+        )
+        layout.addWidget(w2)
 
-        btn_median = QPushButton("▶  Mediana")
-        btn_median.clicked.connect(self._on_apply_median)
-        btn_median.setToolTip("Remove ruído granular — preserva bordas")
-        layout.addWidget(btn_median)
-
-        btn_bilateral = QPushButton("▶  Bilateral")
-        btn_bilateral.clicked.connect(self._on_apply_bilateral)
-        btn_bilateral.setToolTip("Suaviza preservando contornos de grão")
-        layout.addWidget(btn_bilateral)
+        self.chk_bilateral, self.sld_bilateral, w3 = self._build_toggle_slider(
+            "Bilateral", 1, 25, 9,
+            on_toggled=self._on_bilateral_toggled,
+            on_value_changed=self._on_bilateral_value,
+            value_formatter=lambda v: f"d={v}",
+        )
+        layout.addWidget(w3)
 
         return group
 
@@ -273,29 +323,36 @@ class MainWindow(QMainWindow):
         group = QGroupBox("Realce de Bordas")
         layout = QVBoxLayout(group)
 
-        btn_canny = QPushButton("▶  Canny")
-        btn_canny.clicked.connect(self._on_apply_canny)
-        btn_canny.setToolTip("Detecção de bordas binárias")
-        layout.addWidget(btn_canny)
+        self.chk_canny, self.sld_canny, w1 = self._build_toggle_slider(
+            "Canny", 10, 200, 50,
+            on_toggled=self._on_canny_toggled,
+            on_value_changed=self._on_canny_value,
+            value_formatter=lambda v: f"t1={v}",
+        )
+        layout.addWidget(w1)
 
-        btn_sobel = QPushButton("▶  Sobel")
-        btn_sobel.clicked.connect(self._on_apply_sobel)
-        btn_sobel.setToolTip("Gradiente de bordas (intensidade proporcional)")
-        layout.addWidget(btn_sobel)
+        self.chk_sobel, self.sld_sobel, w2 = self._build_toggle_slider(
+            "Sobel", 1, 3, 1,
+            on_toggled=self._on_sobel_toggled,
+            on_value_changed=self._on_sobel_value,
+            value_formatter=lambda v: f"ksize={2*v+1}",
+        )
+        layout.addWidget(w2)
 
         return group
 
+    # ──────────────────────────────────────────────
+    # Painel direito e status bar (iguais à versão anterior)
+    # ──────────────────────────────────────────────
+
     def _build_right_panel(self) -> QWidget:
-        """Painel direito: imagem original (topo) e imagem processada (baixo)."""
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
 
-        # Labels de título
         splitter = QSplitter(Qt.Orientation.Vertical)
 
-        # Original
         orig_widget = QWidget()
         orig_layout = QVBoxLayout(orig_widget)
         orig_layout.setContentsMargins(0, 0, 0, 0)
@@ -307,14 +364,13 @@ class MainWindow(QMainWindow):
         orig_layout.addWidget(self.viewer_original)
         splitter.addWidget(orig_widget)
 
-        # Processada
         proc_widget = QWidget()
         proc_layout = QVBoxLayout(proc_widget)
         proc_layout.setContentsMargins(0, 0, 0, 0)
         proc_lbl = QLabel("PROCESSADA")
         proc_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         proc_lbl.setStyleSheet("color: #06d6a0; font-size: 10px; font-weight: bold; letter-spacing: 1px;")
-        self.viewer_processed = ImageViewer("Aplique um filtro para ver o resultado")
+        self.viewer_processed = ImageViewer("Ative um filtro para ver o resultado")
         proc_layout.addWidget(proc_lbl)
         proc_layout.addWidget(self.viewer_processed)
         splitter.addWidget(proc_widget)
@@ -323,7 +379,6 @@ class MainWindow(QMainWindow):
         return widget
 
     def _build_status_bar(self):
-        """Barra de status inferior com informações da imagem."""
         status = QStatusBar()
         self.setStatusBar(status)
 
@@ -349,11 +404,10 @@ class MainWindow(QMainWindow):
         return sep
 
     # ──────────────────────────────────────────────
-    # Ações (slots conectados à toolbar / botões)
+    # Ações da toolbar
     # ──────────────────────────────────────────────
 
     def _on_open_image(self):
-        """Abre diálogo de arquivo e carrega a imagem selecionada."""
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Abrir Imagem Metalográfica",
@@ -372,17 +426,16 @@ class MainWindow(QMainWindow):
             self._processor = ImageProcessor(image)
             self._scale_manager = ScaleManager()
 
-            # Exibe a imagem original
+            self._reset_all_controls()
+
             self.viewer_original.set_image(image)
             self.viewer_processed.set_image(image)
 
-            # Atualiza status
             self.status_file.setText(f"📄 {metadata.file_name}")
             self.status_dims.setText(f"{metadata.width_px} × {metadata.height_px} px")
             self._update_scale_status()
             self._update_controls_state()
 
-            # Abre diálogo de metadados automaticamente
             dlg = MetadataDialog(self._metadata, self)
             dlg.exec()
 
@@ -390,7 +443,6 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Erro ao carregar imagem", str(e))
 
     def _on_calibrate_scale(self):
-        """Abre diálogo de calibração de escala."""
         if self._metadata is None:
             QMessageBox.warning(self, "ARGOS", "Carregue uma imagem primeiro.")
             return
@@ -401,7 +453,6 @@ class MainWindow(QMainWindow):
             self._update_scale_status()
 
     def _on_edit_metadata(self):
-        """Abre diálogo de metadados."""
         if self._metadata is None:
             QMessageBox.warning(self, "ARGOS", "Carregue uma imagem primeiro.")
             return
@@ -409,86 +460,152 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def _on_reset(self):
-        """Reseta todos os filtros, volta à imagem original."""
+        """Desliga todos os filtros (desmarca checkboxes) e reseta o processor."""
         if self._processor is None:
             return
+        self._reset_all_controls()
         self._processor.reset()
         self.viewer_processed.set_image(self._processor.current_image)
         self.status_ops.setText("↺ Reset")
 
-    # --- Filtros ---
+    def _reset_all_controls(self):
+        """Desmarca todos os checkboxes sem disparar recálculo repetido."""
+        for chk in (
+            self.chk_grayscale, self.chk_brightness, self.chk_contrast,
+            self.chk_clahe, self.chk_gaussian, self.chk_median,
+            self.chk_bilateral, self.chk_canny, self.chk_sobel,
+        ):
+            chk.blockSignals(True)
+            chk.setChecked(False)
+            chk.blockSignals(False)
+        for sld in (
+            self.sld_brightness, self.sld_contrast, self.sld_clahe,
+            self.sld_gaussian, self.sld_median, self.sld_bilateral,
+            self.sld_canny, self.sld_sobel,
+        ):
+            sld.setEnabled(False)
 
-    def _on_apply_grayscale(self):
-        self._apply_filter(lambda: self._processor.apply_grayscale(), "Grayscale")
+    # ──────────────────────────────────────────────
+    # Callbacks de filtro — cada um atualiza o estado
+    # do ImageProcessor e chama _on_state_changed()
+    # ──────────────────────────────────────────────
 
-    def _on_apply_brightness_contrast(self):
-        b = self.brightness_slider.value()
-        c = self.contrast_slider.value() / 100.0
-        self._apply_filter(
-            lambda: self._processor.apply_brightness_contrast(b, c),
-            f"Brilho={b}, Contraste={c:.2f}×"
-        )
+    def _on_grayscale_toggled(self, checked: bool):
+        if self._processor is None:
+            return
+        self._processor.grayscale_enabled = checked
+        self._on_state_changed("Grayscale")
 
-    def _on_apply_clahe(self):
-        clip = self.clahe_clip_slider.value() / 10.0
-        self._apply_filter(
-            lambda: self._processor.apply_clahe(clip_limit=clip),
-            f"CLAHE(clip={clip})"
-        )
+    def _on_brightness_toggled(self, checked: bool):
+        if self._processor is None:
+            return
+        self._processor.brightness_enabled = checked
+        self._on_state_changed("Brilho")
 
-    def _on_apply_gaussian(self):
-        k = self.blur_kernel_slider.value()
-        if k % 2 == 0:
-            k += 1
-        self._apply_filter(
-            lambda: self._processor.apply_gaussian(kernel_size=k),
-            f"Gaussian(k={k})"
-        )
+    def _on_brightness_value(self, v: int):
+        if self._processor is None:
+            return
+        self._processor.brightness_value = v
+        self._on_state_changed("Brilho")
 
-    def _on_apply_median(self):
-        k = self.blur_kernel_slider.value()
-        if k % 2 == 0:
-            k += 1
-        self._apply_filter(
-            lambda: self._processor.apply_median(kernel_size=k),
-            f"Median(k={k})"
-        )
+    def _on_contrast_toggled(self, checked: bool):
+        if self._processor is None:
+            return
+        self._processor.contrast_enabled = checked
+        self._on_state_changed("Contraste")
 
-    def _on_apply_bilateral(self):
-        self._apply_filter(
-            lambda: self._processor.apply_bilateral(),
-            "Bilateral"
-        )
+    def _on_contrast_value(self, v: int):
+        if self._processor is None:
+            return
+        self._processor.contrast_value = v / 100.0
+        self._on_state_changed("Contraste")
 
-    def _on_apply_canny(self):
-        self._apply_filter(
-            lambda: self._processor.apply_canny(),
-            "Canny"
-        )
+    def _on_clahe_toggled(self, checked: bool):
+        if self._processor is None:
+            return
+        self._processor.clahe_enabled = checked
+        self._on_state_changed("CLAHE")
 
-    def _on_apply_sobel(self):
-        self._apply_filter(
-            lambda: self._processor.apply_sobel(),
-            "Sobel"
-        )
+    def _on_clahe_value(self, v: int):
+        if self._processor is None:
+            return
+        self._processor.clahe_clip = v / 10.0
+        self._on_state_changed("CLAHE")
 
-    def _apply_filter(self, fn, label: str):
+    def _on_gaussian_toggled(self, checked: bool):
+        if self._processor is None:
+            return
+        self._processor.gaussian_enabled = checked
+        self._on_state_changed("Gaussiano")
+
+    def _on_gaussian_value(self, v: int):
+        if self._processor is None:
+            return
+        self._processor.gaussian_kernel = v if v % 2 else v + 1
+        self._on_state_changed("Gaussiano")
+
+    def _on_median_toggled(self, checked: bool):
+        if self._processor is None:
+            return
+        self._processor.median_enabled = checked
+        self._on_state_changed("Mediana")
+
+    def _on_median_value(self, v: int):
+        if self._processor is None:
+            return
+        self._processor.median_kernel = v if v % 2 else v + 1
+        self._on_state_changed("Mediana")
+
+    def _on_bilateral_toggled(self, checked: bool):
+        if self._processor is None:
+            return
+        self._processor.bilateral_enabled = checked
+        self._on_state_changed("Bilateral")
+
+    def _on_bilateral_value(self, v: int):
+        if self._processor is None:
+            return
+        self._processor.bilateral_d = v
+        self._on_state_changed("Bilateral")
+
+    def _on_canny_toggled(self, checked: bool):
+        if self._processor is None:
+            return
+        self._processor.canny_enabled = checked
+        self._on_state_changed("Canny")
+
+    def _on_canny_value(self, v: int):
+        if self._processor is None:
+            return
+        # threshold2 mantido proporcional (3x), padrão comum para Canny
+        self._processor.canny_threshold1 = float(v)
+        self._processor.canny_threshold2 = float(v * 3)
+        self._on_state_changed("Canny")
+
+    def _on_sobel_toggled(self, checked: bool):
+        if self._processor is None:
+            return
+        self._processor.sobel_enabled = checked
+        self._on_state_changed("Sobel")
+
+    def _on_sobel_value(self, v: int):
+        if self._processor is None:
+            return
+        self._processor.sobel_ksize = 2 * v + 1  # 1→3, 2→5, 3→7
+        self._on_state_changed("Sobel")
+
+    def _on_state_changed(self, label: str):
         """
-        Método genérico para aplicar qualquer filtro.
-        Evita repetição de código nos métodos acima.
-
-        Args:
-            fn: Função lambda que chama o filtro no processor.
-            label: Nome para mostrar na status bar.
+        Ponto único de recálculo: qualquer mudança de checkbox ou slider
+        passa por aqui. Recalcula o pipeline inteiro e atualiza a tela.
         """
         if self._processor is None:
-            QMessageBox.warning(self, "ARGOS", "Carregue uma imagem primeiro.")
             return
         try:
-            fn()
+            self._processor.rebuild()
             self.viewer_processed.set_image(self._processor.current_image)
             ops = len(self._processor.operation_log)
-            self.status_ops.setText(f"✔ {label}  ({ops} op{'s' if ops > 1 else ''})")
+            self.status_ops.setText(f"✔ {label}  ({ops} filtro{'s' if ops != 1 else ''} ativo{'s' if ops != 1 else ''})")
         except Exception as e:
             QMessageBox.warning(self, "Erro ao aplicar filtro", str(e))
 
@@ -497,14 +614,12 @@ class MainWindow(QMainWindow):
     # ──────────────────────────────────────────────
 
     def _update_controls_state(self):
-        """Habilita/desabilita controles conforme estado."""
         has_image = self._original_image is not None
         self.act_scale.setEnabled(has_image)
         self.act_metadata.setEnabled(has_image)
         self.act_reset.setEnabled(has_image)
 
     def _update_scale_status(self):
-        """Atualiza o label de escala na status bar."""
         if self._scale_manager.is_calibrated:
             self.status_scale.setText(
                 f"⚖️  {self._scale_manager.um_per_px:.4f} µm/px"
@@ -515,7 +630,6 @@ class MainWindow(QMainWindow):
             self.status_scale.setStyleSheet("color: #f4a261;")
 
     def _apply_styles(self):
-        """Estilo global da janela principal."""
         self.setStyleSheet("""
             QMainWindow { background-color: #0a0a1a; }
 
@@ -565,6 +679,19 @@ class MainWindow(QMainWindow):
 
             QLabel { color: #8090b0; font-size: 12px; }
 
+            QCheckBox { color: #c0c0e0; font-size: 12px; spacing: 8px; }
+            QCheckBox::indicator {
+                width: 14px;
+                height: 14px;
+                border: 1px solid #2a2a4a;
+                border-radius: 3px;
+                background-color: #131330;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #00b4d8;
+                border-color: #00b4d8;
+            }
+
             QSlider::groove:horizontal {
                 height: 4px;
                 background: #1a1a3a;
@@ -577,9 +704,15 @@ class MainWindow(QMainWindow):
                 margin: -5px 0;
                 border-radius: 7px;
             }
+            QSlider::handle:horizontal:disabled {
+                background: #333355;
+            }
             QSlider::sub-page:horizontal {
                 background: #004d65;
                 border-radius: 2px;
+            }
+            QSlider::sub-page:horizontal:disabled {
+                background: #1a1a3a;
             }
 
             QPushButton {

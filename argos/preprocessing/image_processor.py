@@ -4,11 +4,39 @@ preprocessing/image_processor.py
 Orquestra todos os filtros de pré-processamento.
 É o ponto central da Camada 2 — Preparação.
 
-Responsabilidades:
-  ✔ Aplicar filtros na ordem correta
-  ✔ Manter referência à imagem original (nunca destruir)
-  ✔ Registrar parâmetros de cada operação (rastreabilidade)
-  ✔ Permitir reset para estado anterior
+MUDANÇA DE ARQUITETURA (v2):
+    A versão anterior empilhava operações: cada apply_x() rodava em cima
+    do resultado da anterior, e não havia como "desligar" um filtro já
+    aplicado sem resetar tudo.
+
+    Esta versão é um PIPELINE DECLARATIVO: o processor guarda o ESTADO de
+    cada filtro (ligado/desligado + parâmetro atual), e o método rebuild()
+    recalcula a imagem processada DO ZERO a partir da original, aplicando
+    apenas os filtros que estão enabled=True, sempre na mesma ordem fixa.
+
+    Por que isso importa:
+        Com controles do tipo checkbox + slider, o usuário liga/desliga e
+        ajusta valores livremente. Se cada mudança empilhasse sobre a
+        imagem já processada, desligar um filtro não teria como reverter
+        o efeito — o dado já estaria destruído. Recalcular sempre a partir
+        do original garante reversibilidade real (princípio central do
+        ARGOS: "nada é automático sem visualização, tudo é reversível").
+
+    Custo: cada mudança reprocessa a imagem inteira. Para imagens de
+    microscopia (tipicamente < 4000x4000), isso ainda roda em milissegundos
+    com OpenCV. Se no futuro isso pesar, dá pra cachear estágios
+    intermediários — não é necessário agora.
+
+Ordem fixa do pipeline (não é reordenável pelo usuário nesta fase):
+    1. Grayscale
+    2. Brilho
+    3. Contraste
+    4. CLAHE
+    5. Gaussiano
+    6. Mediana
+    7. Bilateral
+    8. Canny
+    9. Sobel
 """
 
 from typing import Optional
@@ -23,16 +51,20 @@ from preprocessing.filters.clahe import CLAHEFilter
 
 class ImageProcessor:
     """
-    Gerencia o pré-processamento de imagens metalográficas.
+    Pipeline declarativo de pré-processamento.
 
-    Armazena a imagem original intocada e a imagem atual (processada).
-    Todos os filtros são aplicados sobre a imagem atual.
+    Cada filtro tem um estado `<nome>_enabled: bool` e, quando aplicável,
+    um ou mais parâmetros (`<nome>_<param>`). A UI só precisa:
+        1. Alterar o atributo de estado correspondente
+        2. Chamar rebuild()
+        3. Ler current_image
 
     Uso:
         processor = ImageProcessor(imagem_original)
-        processor.apply_grayscale()
-        processor.apply_clahe(clip_limit=2.0)
-        processor.apply_median(kernel_size=5)
+        processor.grayscale_enabled = True
+        processor.clahe_enabled = True
+        processor.clahe_clip = 3.0
+        processor.rebuild()
         resultado = processor.current_image
     """
 
@@ -43,8 +75,45 @@ class ImageProcessor:
                       Esta imagem NUNCA será modificada.
         """
         self._original: np.ndarray = original.copy()
-        self._current: np.ndarray = original.copy()
-        self._log: list[str] = []  # Log de operações aplicadas
+
+        # --- Conversão ---
+        self.grayscale_enabled: bool = False
+
+        # --- Brilho / Contraste (dois filtros independentes) ---
+        self.brightness_enabled: bool = False
+        self.brightness_value: int = 0        # -127 a 127
+
+        self.contrast_enabled: bool = False
+        self.contrast_value: float = 1.0      # 0.1 a 3.0
+
+        # --- CLAHE ---
+        self.clahe_enabled: bool = False
+        self.clahe_clip: float = 2.0
+        self.clahe_tile_grid: tuple = (8, 8)
+
+        # --- Suavização (independentes entre si — podem ser combinados) ---
+        self.gaussian_enabled: bool = False
+        self.gaussian_kernel: int = 5
+
+        self.median_enabled: bool = False
+        self.median_kernel: int = 5
+
+        self.bilateral_enabled: bool = False
+        self.bilateral_d: int = 9
+        self.bilateral_sigma_color: float = 75
+        self.bilateral_sigma_space: float = 75
+
+        # --- Realce de bordas ---
+        self.canny_enabled: bool = False
+        self.canny_threshold1: float = 50
+        self.canny_threshold2: float = 150
+
+        self.sobel_enabled: bool = False
+        self.sobel_ksize: int = 3
+
+        self._current: np.ndarray = self._original.copy()
+        self._log: list[str] = []
+        self.rebuild()
 
     @property
     def original_image(self) -> np.ndarray:
@@ -53,106 +122,80 @@ class ImageProcessor:
 
     @property
     def current_image(self) -> np.ndarray:
-        """Retorna a imagem com os processamentos aplicados até agora."""
+        """Retorna a imagem com o pipeline atual aplicado."""
         return self._current.copy()
 
     @property
     def operation_log(self) -> list[str]:
-        """Retorna o histórico de operações aplicadas."""
+        """Lista dos filtros atualmente ativos, na ordem de aplicação."""
         return self._log.copy()
 
     def reset(self):
-        """Desfaz TODOS os processamentos — volta à imagem original."""
-        self._current = self._original.copy()
-        self._log.append(">>> RESET: voltou para imagem original")
+        """Desliga todos os filtros e volta aos parâmetros padrão."""
+        original = self._original
+        self.__init__(original)
+        self._log = [">>> RESET: todos os filtros desligados"]
 
-    # ──────────────────────────────────────────────
-    # Conversão
-    # ──────────────────────────────────────────────
-
-    def apply_grayscale(self):
-        """Converte a imagem para escala de cinza."""
-        if len(self._current.shape) == 3:
-            self._current = cv2.cvtColor(self._current, cv2.COLOR_BGR2GRAY)
-            self._log.append("Convertida para grayscale")
-
-    def apply_brightness_contrast(self, brightness: int = 0, contrast: float = 1.0):
+    def rebuild(self):
         """
-        Ajusta brilho e contraste da imagem.
+        Recalcula a imagem processada do zero, a partir da original,
+        aplicando apenas os filtros com enabled=True, na ordem fixa.
 
-        Fórmula: output = contrast × input + brightness
-
-        Args:
-            brightness: Deslocamento de brilho. Range: -127 a +127.
-                        0 = sem mudança.
-            contrast: Multiplicador de contraste. Range: 0.0 a 3.0.
-                      1.0 = sem mudança. >1 = mais contraste.
+        Deve ser chamado toda vez que qualquer estado (enabled ou
+        parâmetro) é alterado pela UI.
         """
-        self._current = cv2.convertScaleAbs(
-            self._current, alpha=contrast, beta=brightness
-        )
-        self._log.append(
-            f"Brilho/Contraste: brightness={brightness}, contrast={contrast:.2f}"
-        )
+        img = self._original.copy()
+        log: list[str] = []
 
-    # ──────────────────────────────────────────────
-    # Filtros
-    # ──────────────────────────────────────────────
+        if self.grayscale_enabled:
+            if len(img.shape) == 3:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            log.append("Grayscale")
 
-    def apply_gaussian(self, kernel_size: int = 5, sigma: float = 0):
-        """Aplica filtro gaussiano."""
-        f = GaussianBlurFilter(kernel_size=kernel_size, sigma=sigma)
-        self._current = f.apply(self._current)
-        self._log.append(str(f))
+        if self.brightness_enabled:
+            img = cv2.convertScaleAbs(img, alpha=1.0, beta=self.brightness_value)
+            log.append(f"Brilho({self.brightness_value})")
 
-    def apply_median(self, kernel_size: int = 5):
-        """Aplica filtro de mediana."""
-        f = MedianFilter(kernel_size=kernel_size)
-        self._current = f.apply(self._current)
-        self._log.append(str(f))
+        if self.contrast_enabled:
+            img = cv2.convertScaleAbs(img, alpha=self.contrast_value, beta=0)
+            log.append(f"Contraste({self.contrast_value:.2f}x)")
 
-    def apply_bilateral(self, d: int = 9, sigma_color: float = 75, sigma_space: float = 75):
-        """Aplica filtro bilateral."""
-        f = BilateralFilter(d=d, sigma_color=sigma_color, sigma_space=sigma_space)
-        self._current = f.apply(self._current)
-        self._log.append(str(f))
+        if self.clahe_enabled:
+            f = CLAHEFilter(clip_limit=self.clahe_clip, tile_grid_size=self.clahe_tile_grid)
+            img = f.apply(img)
+            log.append(str(f))
 
-    def apply_clahe(self, clip_limit: float = 2.0, tile_grid_size: tuple = (8, 8)):
-        """Aplica CLAHE para melhoria de contraste local."""
-        f = CLAHEFilter(clip_limit=clip_limit, tile_grid_size=tile_grid_size)
-        self._current = f.apply(self._current)
-        self._log.append(str(f))
+        if self.gaussian_enabled:
+            f = GaussianBlurFilter(kernel_size=self.gaussian_kernel)
+            img = f.apply(img)
+            log.append(str(f))
 
-    # ──────────────────────────────────────────────
-    # Realce de bordas
-    # ──────────────────────────────────────────────
+        if self.median_enabled:
+            f = MedianFilter(kernel_size=self.median_kernel)
+            img = f.apply(img)
+            log.append(str(f))
 
-    def apply_canny(self, threshold1: float = 50, threshold2: float = 150):
-        """
-        Detecção de bordas com algoritmo de Canny.
-        Resultado: imagem binária com bordas em branco.
+        if self.bilateral_enabled:
+            f = BilateralFilter(
+                d=self.bilateral_d,
+                sigma_color=self.bilateral_sigma_color,
+                sigma_space=self.bilateral_sigma_space,
+            )
+            img = f.apply(img)
+            log.append(str(f))
 
-        threshold1/threshold2: limiares para histerese.
-        """
-        gray = self._current
-        if len(gray.shape) == 3:
-            gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
-        self._current = cv2.Canny(gray, threshold1, threshold2)
-        self._log.append(f"Canny(t1={threshold1}, t2={threshold2})")
+        if self.canny_enabled:
+            gray = img if len(img.shape) == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            img = cv2.Canny(gray, self.canny_threshold1, self.canny_threshold2)
+            log.append(f"Canny(t1={self.canny_threshold1:.0f}, t2={self.canny_threshold2:.0f})")
 
-    def apply_sobel(self, ksize: int = 3):
-        """
-        Calcula gradiente de Sobel (magnitude das bordas).
-        Mostra bordas com intensidade proporcional ao contraste.
-        """
-        gray = self._current
-        if len(gray.shape) == 3:
-            gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+        if self.sobel_enabled:
+            gray = img if len(img.shape) == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=self.sobel_ksize)
+            sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=self.sobel_ksize)
+            magnitude = np.sqrt(sobel_x**2 + sobel_y**2)
+            img = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            log.append(f"Sobel(ksize={self.sobel_ksize})")
 
-        sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=ksize)
-        sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=ksize)
-        magnitude = np.sqrt(sobel_x**2 + sobel_y**2)
-
-        # Normaliza para 0-255
-        self._current = cv2.normalize(magnitude, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        self._log.append(f"Sobel(ksize={ksize})")
+        self._current = img
+        self._log = log if log else ["(nenhum filtro ativo — imagem original)"]
